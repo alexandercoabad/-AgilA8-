@@ -12,7 +12,7 @@
 // the bootloader routine changes; don't hand-edit the case statement.
 //
 // Same imem-style 1-cycle-latency port convention as every other
-// memory front-end in this design (ram32.v, qspi_shared_engine.v).
+// memory front-end in this design (shared_ram.v, qspi_shared_engine.v).
 // Always present, always readable - this is what makes address 0x0000
 // (the CPU's reset vector) valid with or without the QSPI Pmod
 // connected, which is the whole point of this module existing.

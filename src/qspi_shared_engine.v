@@ -3,8 +3,8 @@
 // One shared physical SPI shift engine (SCK/MOSI/MISO + 40-bit shift
 // register) driving three front-ends: flash (CS0), PSRAM (CS1), and a
 // generic SPI peripheral (CS2 - requires cutting the RAM B trace on the
-// Pmod first; see spi_ctrl.v's header for the board modification this
-// depends on). Replaces qspi_flash_reader.v + qspi_psram_ctrl.v +
+// Pmod first; see README.md / docs/info.md for the board modification
+// this depends on). Replaces qspi_flash_reader.v + qspi_psram_ctrl.v +
 // spi_ctrl.v as three separate, near-identical FSMs (each ~78/78/40
 // flip-flops) with one shared engine (~85 flip-flops) plus three thin
 // front-ends (~15-20 flip-flops each for their own request-latching and,
@@ -79,6 +79,14 @@ module qspi_shared_engine #(
     output reg  [7:0]  spi_rdata,
     output reg         spi_ready,
     output wire        spi_hit,
+    output wire        spi_dc,        // D/C select for a 4-wire SPI
+                                        // display, wired externally to
+                                        // uio[4] (previously hardcoded
+                                        // high/unused - see tt_um_agila8.v).
+                                        // Gated below (see spi_dc assign) -
+                                        // do not confuse with spi_dc_r,
+                                        // the plain software-facing
+                                        // register this derives from.
 
     // ---- Pmod-facing pins ----
     output wire cs_n_flash, // -> uio[0] (CS0)
@@ -113,6 +121,10 @@ module qspi_shared_engine #(
     assign spi_hit = (spi_addr == ADDR_DATA) || (spi_addr == ADDR_CTRL);
 
     reg [1:0] div_sel;
+    reg       spi_dc_r;  // software-facing register - see the gated
+                          // `spi_dc` output assign (near cs_n_spi) for
+                          // why the actual pin doesn't just mirror this
+                          // directly
     reg [7:0] spi_last_rx;
 
     wire [19:0] spi_half_period =
@@ -154,6 +166,20 @@ module qspi_shared_engine #(
     assign cs_n_flash = !(cs_active_r && owner_r == OWNER_FLASH);
     assign cs_n_psram = !(cs_active_r && owner_r == OWNER_PSRAM);
     assign cs_n_spi   = !(cs_active_r && owner_r == OWNER_SPI);
+
+    // *** BUG FIX (see chat): a prior version of this feature drove
+    // spi_dc directly from spi_dc_r as a plain, always-live register -
+    // a real regression of the exact bug already found and fixed
+    // earlier in this project's history for the original `dc` signal
+    // (see qspi_flash_reader.v's history / earlier chat notes). SD2 is
+    // shared with flash/PSRAM's /WP line on this same physical Pmod
+    // bus and must idle HIGH except during a genuinely active CS2
+    // transaction - a persistent spi_dc_r=0 (command mode) would sit
+    // low across every subsequent flash/PSRAM access with nothing to
+    // do with the display. Same gating pattern as cs_n_spi immediately
+    // above: only reflect spi_dc_r while THIS transaction is actually
+    // the SPI owner's, idle high otherwise.
+    assign spi_dc = (cs_active_r && owner_r == OWNER_SPI) ? spi_dc_r : 1'b1;
 
     // Flash/PSRAM consumers sample rdata in lockstep with the same-cycle
     // ready pulse (see a8_core.v: `if (imem_ready) instr_hi<=imem_rdata`
@@ -248,6 +274,13 @@ module qspi_shared_engine #(
 
             div_sel       <= 2'd3; // slowest, safest default (spi_ctrl.v parity)
             spi_last_rx   <= 8'h00;
+            spi_dc_r    <= 1'b1; // default: command mode is dc=0 on
+                                     // most displays (SSD1306 included),
+                                     // so reset to the *safer* idle state
+                                     // (1=data) rather than accidentally
+                                     // sitting in command mode if
+                                     // software forgets to set this
+                                     // before the very first transfer
         end else begin
             flash_ready <= 1'b0;
             psram_ready <= 1'b0;
@@ -259,8 +292,18 @@ module qspi_shared_engine #(
 
             // spi_ctrl's CTRL register - plain, always-live, independent
             // of the transfer FSM (same reasoning as spi_ctrl.v).
-            if (spi_valid && spi_we && spi_addr == ADDR_CTRL)
-                div_sel <= spi_wdata[1:0];
+            // Bits [1:0] = clock divider select. Bit [2] = D/C (Data/
+            // Command) select for driving a 4-wire SPI display (e.g.
+            // SSD1306): 0 = command, 1 = data. Purely a static output
+            // level, unrelated to the transfer FSM - software sets it
+            // before each SPI_DATA write to say what kind of byte is
+            // about to go out, exactly like toggling a GPIO pin by
+            // hand, just routed through this register instead since
+            // uio[4] isn't a plain GPIO pin.
+            if (spi_valid && spi_we && spi_addr == ADDR_CTRL) begin
+                div_sel  <= spi_wdata[1:0];
+                spi_dc_r <= spi_wdata[2];
+            end
             if (spi_valid && spi_addr == ADDR_CTRL)
                 spi_ready <= 1'b1;
 
@@ -270,7 +313,7 @@ module qspi_shared_engine #(
                 && !just_finished_spi)
                 spi_ready <= 1'b1;
 
-            spi_rdata <= (spi_addr == ADDR_CTRL) ? {6'b0, div_sel} : spi_last_rx;
+            spi_rdata <= (spi_addr == ADDR_CTRL) ? {5'b0, spi_dc_r, div_sel} : spi_last_rx;
 
             case (state)
                 S_IDLE: begin

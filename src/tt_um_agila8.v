@@ -58,22 +58,17 @@ module tt_um_agila8 (
     // (0xF3) and SPI_CTRL (0xF4) now claim two of those five bytes for
     // the new peripheral - any existing software that stored ordinary
     // data at DMEM[0xF3] or DMEM[0xF4] will now silently hit the SPI
-    // controller instead. 0xF5-0xF7 remain plain PSRAM, unaffected.
+    // controller instead. 0xF5/0xF6 are free again (previously
+    // IMEM_WADDR/IMEM_WDATA - no longer needed now that DMEM and IRAM
+    // share the same physical bytes, see shared_ram.v). 0xF7 is
+    // FLASH_MODE (see below).
     //
-    // NOTE - RAM32 split: 0x00-0x7F now goes to on-chip ram32 instead of
-    // external PSRAM, making the QSPI Pmod optional for DMEM as long as
-    // software stays inside that range - see ram32.v's header for the
-    // uninitialized-on-reset caveat this introduces, and README/
-    // docs/info.md for the AREA CAVEAT this creates (ram32 is a plain
-    // 128-byte flip-flop array, not a dense macro - this was
-    // deliberately NOT done earlier in the project specifically because
-    // it doesn't fit a 1x2 tile budget; see chat/commit history for the
-    // full reasoning). 0x80-0xEF remains external PSRAM - flash (CS0)
-    // is still required for IMEM regardless, this only makes the Pmod
-    // optional for the DMEM side, not for the design as a whole.
+    // NOTE - shared RAM: 0x00-0x7F now goes to on-chip shared_ram
+    // instead of external PSRAM, making the QSPI Pmod optional for
+    // DMEM as long as software stays inside that range - see
+    // shared_ram.v's header for the uninitialized-on-reset caveat this
+    // introduces. 0x80-0xEF remains external PSRAM.
     //------------------------------------------------------------------
-
-    wire ram32_hit_comb = (dmem_addr < 8'h80);
 
     wire periph_hit_comb =
            (dmem_addr == 8'hF0)
@@ -90,33 +85,36 @@ module tt_um_agila8 (
            (dmem_addr == 8'hF3)
         || (dmem_addr == 8'hF4);
 
-    wire iram_w_hit_comb =
-           (dmem_addr == 8'hF5)
-        || (dmem_addr == 8'hF6);
-
     //------------------------------------------------------------------
     // On-chip IMEM (0x0000-0x00FF) - boot_rom (0x00-0x7F, fixed
-    // content) + iram (0x80-0xFF, written at runtime via IMEM_WADDR/
-    // IMEM_WDATA below). This is what makes the QSPI Pmod fully
-    // optional: address 0x0000, the reset vector, now always resolves
-    // to on-chip content whether or not flash is even connected. See
-    // boot_rom.v's header and build_boot_rom.py's docstring for the
-    // bootloader protocol that lives here.
+    // content) + shared_ram's IMEM port (0x80-0xFF, the SAME 128 bytes
+    // as DMEM 0x00-0x7F - see shared_ram.v's header for why this is a
+    // deliberate merge, not aliasing left in by accident). This is
+    // what makes the QSPI Pmod fully optional: address 0x0000, the
+    // reset vector, now always resolves to on-chip content whether or
+    // not flash is even connected. See boot_rom.v's header and
+    // build_boot_rom.py's docstring for the bootloader protocol that
+    // lives here.
     //
     // FLASH_MODE (0xF7, write-any-value-to-set, sticky until reset):
     // boot_rom's timeout fallback needs to hand control to flash, but
     // a8_core's JALR truncates its target to 8 bits ({8'h00, rs1_data
-    // + imm_sext} in a8_core.v) - it can only ever reach 0x0000-0x00FF,
-    // and JAL's PC-relative range (+-62 bytes) can't cover the gap to
-    // flash space either. So instead of trying to jump TO flash (which
-    // no instruction in this ISA can do from boot_rom's fixed location),
-    // this flag changes what memory backs address 0x0000 itself: once
-    // set, imem_addr 0x0000 and up resolve directly to flash (unrebased
-    // - flash's own byte 0 is whatever a normal, existing flash image
-    // already has at its start, unchanged), and boot_rom/iram become
-    // completely unreachable until the next reset. The bootloader's
-    // timeout path just needs SW FLASH_MODE then JALR to 0x0000 - both
-    // trivially within JALR's 8-bit reach.
+    // + imm_sext} in a8_core.v) - it can only ever reach 0x0000-0x00FF.
+    // So instead of trying to jump TO flash directly (structurally
+    // impossible from boot_rom - no instruction in this ISA can reach
+    // 0x0100+ from a fixed low address), this flag changes what
+    // 0x0080-0x00FF resolves to: normally shared_ram's IMEM port,
+    // but flash (rebased by -0x80) once set. boot_rom (0x0000-0x007F)
+    // is ALWAYS mapped regardless of flash_mode - it has to be, since
+    // the SW+JALR sequence that sets this flag is itself stored there
+    // and must keep fetching correctly right up until the JALR
+    // actually completes. Both the successful-load path (LOAD_DONE)
+    // and the timeout path now JALR to the SAME address, 0x0080 -
+    // flash_mode only changes what that address means. See
+    // sim_full_top.py for an independent, from-scratch re-verification
+    // of this exact routing (it caught an earlier version that
+    // incorrectly gated boot_rom on !flash_mode too, which broke
+    // fetching the JALR instruction's own bytes mid-flight).
     //------------------------------------------------------------------
 
     reg  flash_mode_r;
@@ -129,8 +127,13 @@ module tt_um_agila8 (
             flash_mode_r <= 1'b1;
     end
 
-    wire        onchip_imem_hit = (imem_addr < 16'h0100) && !flash_mode_r;
-    wire        boot_rom_hit    = (imem_addr < 16'h0080) && !flash_mode_r;
+    wire boot_rom_hit        = (imem_addr < 16'h0080);
+    wire shared_ram_imem_hit = (imem_addr >= 16'h0080) && (imem_addr < 16'h0100) && !flash_mode_r;
+    wire flash_imem_hit      = !boot_rom_hit && !shared_ram_imem_hit;
+    // Kept for debug-probe compatibility (tb_debug6.v reads this
+    // hierarchically) - not otherwise used now that boot_rom_hit /
+    // shared_ram_imem_hit are precise enough on their own.
+    wire onchip_imem_hit     = boot_rom_hit || shared_ram_imem_hit;
 
     wire [7:0]  boot_rom_rdata;
     wire        boot_rom_ready;
@@ -140,50 +143,45 @@ module tt_um_agila8 (
         .rst_n (rst_n),
 
         .addr  (imem_addr[6:0]),
-        .valid (imem_valid && onchip_imem_hit && boot_rom_hit),
+        .valid (imem_valid && boot_rom_hit),
 
         .rdata (boot_rom_rdata),
         .ready (boot_rom_ready)
     );
 
-    wire [7:0]  iram_rdata;
-    wire        iram_ready;
-    wire [7:0]  iram_dmem_rdata;
-    wire        iram_dmem_ready;
-    wire        iram_dmem_hit;
+    //------------------------------------------------------------------
+    // Shared on-chip RAM (128 bytes total) - serves BOTH DMEM 0x00-0x7F
+    // and IMEM/IRAM 0x80-0xFF from the same physical array. Replaces
+    // the previous separate ram32.v (128B) + iram.v (128B, plus its
+    // own IMEM_WADDR/IMEM_WDATA write-control registers) - see
+    // shared_ram.v's header for the full reasoning. The bootloader now
+    // writes received program bytes with plain SW instructions to
+    // DMEM 0x00-0x7F directly; no separate write-control registers
+    // needed, which also frees 0xF5/0xF6 back up.
+    //------------------------------------------------------------------
 
-    iram iram_inst (
+    wire ram_hit_comb = (dmem_addr < 8'h80);
+
+    wire [7:0] shared_ram_dmem_rdata;
+    wire       shared_ram_dmem_ready;
+    wire [7:0] shared_ram_imem_rdata;
+    wire       shared_ram_imem_ready;
+
+    shared_ram shared_ram_inst (
         .clk   (clk),
         .rst_n (rst_n),
-
-        .imem_addr  (imem_addr[6:0]),
-        .imem_valid (imem_valid && onchip_imem_hit && !boot_rom_hit),
-        .imem_rdata (iram_rdata),
-        .imem_ready (iram_ready),
 
         .dmem_addr  (dmem_addr),
         .dmem_wdata (dmem_wdata),
         .dmem_we    (dmem_we),
-        .dmem_valid (dmem_valid && iram_w_hit_comb),
-        .dmem_rdata (iram_dmem_rdata),
-        .dmem_ready (iram_dmem_ready),
-        .dmem_hit   (iram_dmem_hit)
-    );
+        .dmem_valid (dmem_valid && ram_hit_comb),
+        .dmem_rdata (shared_ram_dmem_rdata),
+        .dmem_ready (shared_ram_dmem_ready),
 
-    wire [7:0] ram32_rdata;
-    wire       ram32_ready;
-
-    ram32 ram32_inst (
-        .clk   (clk),
-        .rst_n (rst_n),
-
-        .addr  (dmem_addr),
-        .wdata (dmem_wdata),
-        .we    (dmem_we),
-        .valid (dmem_valid && ram32_hit_comb),
-
-        .rdata (ram32_rdata),
-        .ready (ram32_ready)
+        .imem_addr  (imem_addr[6:0]),
+        .imem_valid (imem_valid && shared_ram_imem_hit),
+        .imem_rdata (shared_ram_imem_rdata),
+        .imem_ready (shared_ram_imem_ready)
     );
 
     //------------------------------------------------------------------
@@ -204,6 +202,7 @@ module tt_um_agila8 (
     wire [7:0] spi_rdata;
     wire       spi_ready;
     wire       spi_hit_engine;
+    wire       spi_dc;
     wire [7:0] flash_rdata_w;
     wire       flash_ready_w;
 
@@ -214,8 +213,33 @@ module tt_um_agila8 (
         .clk   (clk),
         .rst_n (rst_n),
 
-        .flash_addr           (imem_addr - 16'h0100),
-        .flash_valid          (imem_valid && !onchip_imem_hit),
+        // Two different rebasings share this one flash front-end:
+        // imem_addr>=0x0100 is the traditional flash range (rebase by
+        // -0x100, unaffected by flash_mode); imem_addr<0x0100 only
+        // reaches this mux branch at all when flash_imem_hit is true,
+        // which (given boot_rom_hit/shared_ram_imem_hit above) only
+        // happens for 0x0080 and up - a SINGLE, unconditional -0x80
+        // rebase for the entire range, whether that's 0x0080-0x00FF
+        // under FLASH_MODE or 0x0100+ from a flash-resident program
+        // simply running past 0x00FF (flash_imem_hit fires for both,
+        // by construction, since boot_rom/shared_ram never claim
+        // anything at or above 0x0100). An earlier two-branch version
+        // here (-0x80 below 0x100, -0x100 at/above it) was NOT
+        // continuous: flash_addr jumped from 127 straight back down to
+        // 0 exactly at imem_addr=0x100, silently re-executing flash's
+        // own offset-0 code instead of continuing to offset 128 for
+        // any flash program longer than 128 bytes - confirmed directly
+        // via test_boundary_continuity.py's counter test (a value
+        // meant to increment exactly once came out incremented twice,
+        // proving flash offset 0 re-ran). Verified against
+        // sim_full_top.py, an independent from-scratch model of this
+        // exact routing (see that file for the two earlier, wrong
+        // versions of this line it caught along the way: an
+        // unconditional -0x100 that underflowed for imem_addr<0x100,
+        // and a flash_mode_r-ternary that passed imem_addr through
+        // completely unrebased instead of rebasing by -0x80).
+        .flash_addr           (imem_addr - 16'h0080),
+        .flash_valid          (imem_valid && flash_imem_hit),
         .flash_rdata          (flash_rdata_w),
         .flash_ready          (flash_ready_w),
         .flash_read_delay_cfg (4'd2),
@@ -223,7 +247,7 @@ module tt_um_agila8 (
         .psram_addr           (dmem_addr),
         .psram_wdata          (dmem_wdata),
         .psram_we             (dmem_we),
-        .psram_valid          (dmem_valid && !ram32_hit_comb && !periph_hit_comb && !spi_hit_comb && !iram_w_hit_comb),
+        .psram_valid          (dmem_valid && !ram_hit_comb && !periph_hit_comb && !spi_hit_comb),
         .psram_rdata          (ram_rdata_r),
         .psram_ready          (ram_ready_r),
         .psram_read_delay_cfg (4'd2),
@@ -235,6 +259,7 @@ module tt_um_agila8 (
         .spi_rdata (spi_rdata),
         .spi_ready (spi_ready),
         .spi_hit   (spi_hit_engine),
+        .spi_dc    (spi_dc),
 
         .cs_n_flash (cs_n_flash),
         .cs_n_psram (cs_n_psram),
@@ -245,18 +270,22 @@ module tt_um_agila8 (
     );
 
     //------------------------------------------------------------------
-    // IMEM Mux (boot_rom / iram / flash - see the on-chip IMEM block
-    // above for address ranges)
+    // IMEM Mux (boot_rom / shared_ram / flash - see the on-chip IMEM
+    // block above for address ranges, and note flash_imem_hit already
+    // covers BOTH the traditional 0x0100+ range and the flash_mode-
+    // redirected 0x0080-0x00FF range - it's whatever isn't boot_rom or
+    // shared_ram, by construction, so a plain two-way ternary here is
+    // correct without needing to special-case flash_mode again.)
     //------------------------------------------------------------------
 
     assign imem_rdata =
-        boot_rom_hit    ? boot_rom_rdata :
-        onchip_imem_hit ? iram_rdata     :
-                           flash_rdata_w;
+        boot_rom_hit        ? boot_rom_rdata      :
+        shared_ram_imem_hit ? shared_ram_imem_rdata :
+                               flash_rdata_w;
 
     assign imem_ready =
-        boot_rom_hit    ? boot_rom_ready :
-        onchip_imem_hit ? iram_ready     :
+        boot_rom_hit        ? boot_rom_ready      :
+        shared_ram_imem_hit ? shared_ram_imem_ready :
                            flash_ready_w;
 
     //------------------------------------------------------------------
@@ -297,18 +326,16 @@ module tt_um_agila8 (
     //------------------------------------------------------------------
 
     assign dmem_ready =
-        ram32_hit_comb   ? ram32_ready     :
-        periph_hit_comb  ? periph_ready    :
-        spi_hit_comb     ? spi_ready       :
-        iram_w_hit_comb  ? iram_dmem_ready :
-                            ram_ready_r;
+        ram_hit_comb    ? shared_ram_dmem_ready :
+        periph_hit_comb ? periph_ready          :
+        spi_hit_comb    ? spi_ready             :
+                           ram_ready_r;
 
     assign dmem_rdata =
-        ram32_hit_comb   ? ram32_rdata     :
-        periph_hit_comb  ? periph_rdata    :
-        spi_hit_comb     ? spi_rdata       :
-        iram_w_hit_comb  ? iram_dmem_rdata :
-                            ram_rdata_r;
+        ram_hit_comb    ? shared_ram_dmem_rdata :
+        periph_hit_comb ? periph_rdata          :
+        spi_hit_comb    ? spi_rdata             :
+                           ram_rdata_r;
 
     //------------------------------------------------------------------
     // Outputs
@@ -327,7 +354,13 @@ module tt_um_agila8 (
         cs_n_spi,          // CS2 (general-purpose SPI controller)
         cs_n_psram,        // CS1 (RAM A - DMEM)
         1'b1,              // SD3
-        1'b1,              // SD2
+        spi_dc,            // SD2 - repurposed as D/C select for a
+                            // 4-wire SPI display (e.g. SSD1306),
+                            // driven by qspi_shared_engine's spi_dc
+                            // output. Was previously hardcoded high/
+                            // unused; still requires the same board
+                            // trace-cut provision as CS2 to actually
+                            // repurpose this physical Pmod pin.
         spi_sck_shared,    // SCK
         1'b0,              // SD1 (input)
         spi_mosi_shared,   // SD0
@@ -341,6 +374,6 @@ module tt_um_agila8 (
     //------------------------------------------------------------------
 
     wire _unused_periph =
-        &{1'b0, periph_hit, gpio_dir_w, spi_hit_engine, iram_dmem_hit};
+        &{1'b0, periph_hit, gpio_dir_w, spi_hit_engine};
 
 endmodule

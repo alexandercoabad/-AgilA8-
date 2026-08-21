@@ -30,10 +30,8 @@ project:
     - "a8_alu.v"
     - "a8_regfile.v"
     - "a8_peripherals.v"
-    - "spi_ctrl.v"
-    - "ram32.v"
     - "boot_rom.v"
-    - "iram.v"
+    - "shared_ram.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
@@ -70,3 +68,4 @@ pinout:
 
 # Do not change!
 yaml_version: 6
+
